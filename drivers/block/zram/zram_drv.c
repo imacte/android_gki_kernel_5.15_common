@@ -42,7 +42,7 @@ static DEFINE_IDR(zram_index_idr);
 static DEFINE_MUTEX(zram_index_mutex);
 
 static int zram_major;
-static const char *default_compressor = CONFIG_ZRAM_DEF_COMP;
+static const char *default_compressor = "lz4";
 
 /* Module params (documentation at end) */
 static unsigned int num_devices = 1;
@@ -251,6 +251,8 @@ static ssize_t disksize_show(struct device *dev,
 
 	return scnprintf(buf, PAGE_SIZE, "%llu\n", zram->disksize);
 }
+
+bool task_is_booster(struct task_struct *tsk);
 
 static ssize_t mem_limit_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
@@ -605,10 +607,10 @@ static int read_from_bdev_async(struct zram *zram, struct bio_vec *bvec,
 	}
 
 	if (!parent) {
-		bio->bi_opf = REQ_OP_READ;
+		bio->bi_opf = REQ_OP_READ | REQ_PRIO;
 		bio->bi_end_io = zram_page_end_io;
 	} else {
-		bio->bi_opf = parent->bi_opf;
+		bio->bi_opf = parent->bi_opf | REQ_PRIO;
 		bio_chain(bio, parent);
 	}
 
@@ -1008,6 +1010,9 @@ static ssize_t comp_algorithm_store(struct device *dev,
 	char compressor[ARRAY_SIZE(zram->compressor)];
 	size_t sz;
 
+	if (task_is_booster(current))
+		return len;
+
 	strlcpy(compressor, buf, sizeof(compressor));
 	/* ignore trailing newline */
 	sz = strlen(compressor);
@@ -1274,7 +1279,7 @@ static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,
 	src = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);
 	if (size == PAGE_SIZE) {
 		dst = kmap_atomic(page);
-		memcpy(dst, src, PAGE_SIZE);
+		copy_page(dst, src);
 		kunmap_atomic(dst);
 		ret = 0;
 	} else {

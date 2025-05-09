@@ -1235,27 +1235,24 @@ int tg_nop(struct task_group *tg, void *data)
 static void set_load_weight(struct task_struct *p, bool update_load)
 {
 	int prio = p->static_prio - MAX_RT_PRIO;
-	struct load_weight *load = &p->se.load;
+	struct load_weight lw;
 
-	/*
-	 * SCHED_IDLE tasks get minimal weight:
-	 */
 	if (task_has_idle_policy(p)) {
-		load->weight = scale_load(WEIGHT_IDLEPRIO);
-		load->inv_weight = WMULT_IDLEPRIO;
-		return;
+		lw.weight = scale_load(WEIGHT_IDLEPRIO);
+		lw.inv_weight = WMULT_IDLEPRIO;
+	} else {
+		lw.weight = scale_load(sched_prio_to_weight[prio]);
+		lw.inv_weight = sched_prio_to_wmult[prio];
 	}
 
 	/*
 	 * SCHED_OTHER tasks have to update their load when changing their
 	 * weight
 	 */
-	if (update_load && p->sched_class == &fair_sched_class) {
-		reweight_task(p, prio);
-	} else {
-		load->weight = scale_load(sched_prio_to_weight[prio]);
-		load->inv_weight = sched_prio_to_wmult[prio];
-	}
+	if (update_load && p->sched_class == &fair_sched_class)
+		reweight_task(p, &lw);
+	else
+		p->se.load = lw;
 }
 
 #ifdef CONFIG_UCLAMP_TASK
@@ -4160,38 +4157,43 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	 * A similar smb_rmb() lives in try_invoke_on_locked_down_task().
 	 */
 	smp_rmb();
-	if (READ_ONCE(p->on_rq) && ttwu_runnable(p, wake_flags))
-		goto unlock;
+	if (READ_ONCE(p->on_rq)) {
+		if (ttwu_runnable(p, wake_flags))
+			goto unlock;
+	} else {
+#ifdef CONFIG_SMP
+		/*
+		 * Ensure we load p->on_cpu _after_ p->on_rq, otherwise it would
+		 * be possible to, falsely, observe p->on_cpu == 0.
+		 *
+		 * One must be running (->on_cpu == 1) in order to remove
+		 * oneself from the runqueue.
+		 *
+		 * __schedule() (switch to task 'p')	try_to_wake_up()
+		 *   STORE p->on_cpu = 1		  LOAD p->on_rq
+		 *   UNLOCK rq->lock
+		 *
+		 * __schedule() (put 'p' to sleep)
+		 *   LOCK rq->lock			  smp_rmb();
+		 *   smp_mb__after_spinlock();
+		 *   STORE p->on_rq = 0			  LOAD p->on_cpu
+		 *
+		 * Pairs with the LOCK+smp_mb__after_spinlock() on rq->lock in
+		 * __schedule().  See the comment for smp_mb__after_spinlock().
+		 *
+		 * Form a control-dep-acquire with p->on_rq == 0 above, to
+		 * ensure schedule()'s deactivate_task() has 'happened' and p
+		 * will no longer care about it's own p->state. See the comment
+		 * in __schedule().
+		 */
+		smp_acquire__after_ctrl_dep();
+#endif
+	}
 
 	if (READ_ONCE(p->__state) & TASK_UNINTERRUPTIBLE)
 		trace_sched_blocked_reason(p);
 
 #ifdef CONFIG_SMP
-	/*
-	 * Ensure we load p->on_cpu _after_ p->on_rq, otherwise it would be
-	 * possible to, falsely, observe p->on_cpu == 0.
-	 *
-	 * One must be running (->on_cpu == 1) in order to remove oneself
-	 * from the runqueue.
-	 *
-	 * __schedule() (switch to task 'p')	try_to_wake_up()
-	 *   STORE p->on_cpu = 1		  LOAD p->on_rq
-	 *   UNLOCK rq->lock
-	 *
-	 * __schedule() (put 'p' to sleep)
-	 *   LOCK rq->lock			  smp_rmb();
-	 *   smp_mb__after_spinlock();
-	 *   STORE p->on_rq = 0			  LOAD p->on_cpu
-	 *
-	 * Pairs with the LOCK+smp_mb__after_spinlock() on rq->lock in
-	 * __schedule().  See the comment for smp_mb__after_spinlock().
-	 *
-	 * Form a control-dep-acquire with p->on_rq == 0 above, to ensure
-	 * schedule()'s deactivate_task() has 'happened' and p will no longer
-	 * care about it's own p->state. See the comment in __schedule().
-	 */
-	smp_acquire__after_ctrl_dep();
-
 	/*
 	 * We're doing the wakeup (@success == 1), they did a dequeue (p->on_rq
 	 * == 0), which means we need to do an enqueue, change p->state to
@@ -5882,6 +5884,8 @@ pick_task(struct rq *rq, const struct sched_class *class, struct task_struct *ma
 
 extern void task_vruntime_update(struct rq *rq, struct task_struct *p, bool in_fi);
 
+static void queue_core_balance(struct rq *rq);
+
 static struct task_struct *
 pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
@@ -5929,7 +5933,7 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 		}
 
 		rq->core_pick = NULL;
-		return next;
+		goto out;
 	}
 
 	put_prev_task_balance(rq, prev, rf);
@@ -5976,7 +5980,7 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 			 */
 			WARN_ON_ONCE(fi_before);
 			task_vruntime_update(rq, next, false);
-			goto done;
+			goto out_set_next;
 		}
 	}
 
@@ -6110,8 +6114,12 @@ again:
 		resched_curr(rq_i);
 	}
 
-done:
+out_set_next:
 	set_next_task(rq, next);
+out:
+	if (rq->core->core_forceidle_count && next == rq->idle)
+		queue_core_balance(rq);
+
 	return next;
 }
 
@@ -6170,7 +6178,7 @@ static bool steal_cookie_task(int cpu, struct sched_domain *sd)
 {
 	int i;
 
-	for_each_cpu_wrap(i, sched_domain_span(sd), cpu) {
+	for_each_cpu_wrap(i, sched_domain_span(sd), cpu + 1) {
 		if (i == cpu)
 			continue;
 
@@ -6206,7 +6214,7 @@ static void sched_core_balance(struct rq *rq)
 
 static DEFINE_PER_CPU(struct callback_head, core_balance_head);
 
-void queue_core_balance(struct rq *rq)
+static void queue_core_balance(struct rq *rq)
 {
 	if (!sched_core_enabled(rq))
 		return;
@@ -7423,6 +7431,14 @@ static void __setscheduler_params(struct task_struct *p,
 		__setparam_dl(p, attr);
 	else if (fair_policy(policy))
 		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+
+	/* rt-policy tasks do not have a timerslack */
+	if (task_is_realtime(p)) {
+		p->timer_slack_ns = 0;
+	} else if (p->timer_slack_ns == 0) {
+		/* when switching back to non-rt policy, restore timerslack */
+		p->timer_slack_ns = p->default_timer_slack_ns;
+	}
 
 	/*
 	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
@@ -10350,6 +10366,63 @@ struct uclamp_request {
 	int ret;
 };
 
+struct uclamp_min_multiplier_param {
+	char	*name;
+	u64	min_multiplier;
+};
+
+static struct uclamp_min_multiplier_param uclamp_min_multiplier[] = {
+	{"top-app",	1.00 * POW10(UCLAMP_PERCENT_SHIFT)},
+	{"foreground",	1.00 * POW10(UCLAMP_PERCENT_SHIFT)},
+};
+
+static ssize_t cpu_uclamp_min_multiplier_write(struct kernfs_open_file *of,
+				    char *buf, size_t nbytes,
+				    loff_t off)
+{
+	int ret, i;
+	u64 temp;
+	const char *cgroup_name = of_css(of)->cgroup->kn->name;
+
+	for (i = 0; i < ARRAY_SIZE(uclamp_min_multiplier); i++) {
+		if (!strcmp(cgroup_name, uclamp_min_multiplier[i].name)) {
+			buf = strim(buf);
+			ret = cgroup_parse_float(buf, UCLAMP_PERCENT_SHIFT,
+					     &temp);
+			if (ret != 0)
+				return ret;
+
+			if (temp > POW10(UCLAMP_PERCENT_SHIFT))
+				return -ERANGE;
+
+			uclamp_min_multiplier[i].min_multiplier = temp;
+			break;
+		}
+	}
+
+	return nbytes;
+}
+
+static int cpu_uclamp_min_multiplier_show(struct seq_file *sf, void *v)
+{
+	int i;
+	u64 percent;
+	u32 rem;
+	const char *cgroup_name = seq_css(sf)->cgroup->kn->name;
+
+	for (i = 0; i < ARRAY_SIZE(uclamp_min_multiplier); i++) {
+		if (!strcmp(cgroup_name, uclamp_min_multiplier[i].name)) {
+			percent = div_u64_rem(uclamp_min_multiplier[i].min_multiplier,
+							 POW10(UCLAMP_PERCENT_SHIFT), &rem);
+			seq_printf(sf, "%llu.%0*u\n", percent, UCLAMP_PERCENT_SHIFT, rem);
+			return 0;
+		}
+	}
+
+	seq_printf(sf, "Unavailable\n");
+	return 0;
+}
+
 static inline struct uclamp_request
 capacity_from_percent(char *buf)
 {
@@ -10416,6 +10489,34 @@ static ssize_t cpu_uclamp_min_write(struct kernfs_open_file *of,
 				    char *buf, size_t nbytes,
 				    loff_t off)
 {
+	int ret, i;
+	u64 percent;
+	u32 rem;
+	char temp_buf[8];
+	const char *cgroup_name = of_css(of)->cgroup->kn->name;
+
+	for (i = 0; i < ARRAY_SIZE(uclamp_min_multiplier); i++) {
+		if (!strcmp(cgroup_name, uclamp_min_multiplier[i].name)) {
+			buf = strim(buf);
+			if (strcmp(buf, "max")) {
+				ret = cgroup_parse_float(buf, UCLAMP_PERCENT_SHIFT,
+						     &percent);
+				if (ret != 0)
+					return ret;
+			} else {
+				percent = UCLAMP_PERCENT_SCALE;
+			}
+			
+			percent = percent * uclamp_min_multiplier[i].min_multiplier /
+					POW10(UCLAMP_PERCENT_SHIFT);
+			percent = div_u64_rem(percent, POW10(UCLAMP_PERCENT_SHIFT), &rem);
+			
+			snprintf(temp_buf, sizeof(temp_buf), "%llu.%0*u", percent, UCLAMP_PERCENT_SHIFT, rem);
+			buf = temp_buf;
+			break;
+		}
+	}
+
 	return cpu_uclamp_write(of, buf, nbytes, off, UCLAMP_MIN);
 }
 
@@ -10910,6 +11011,12 @@ static struct cftype cpu_legacy_files[] = {
 		.flags = CFTYPE_NOT_ON_ROOT,
 		.seq_show = cpu_uclamp_min_show,
 		.write = cpu_uclamp_min_write,
+	},
+	{
+		.name = "uclamp.min.multiplier",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = cpu_uclamp_min_multiplier_show,
+		.write = cpu_uclamp_min_multiplier_write,
 	},
 	{
 		.name = "uclamp.max",

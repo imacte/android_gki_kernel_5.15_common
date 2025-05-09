@@ -479,7 +479,7 @@ static void psi_avgs_work(struct work_struct *work)
 		group->avg_next_update = update_averages(group, now);
 
 	if (nonidle) {
-		schedule_delayed_work(dwork, nsecs_to_jiffies(
+		queue_delayed_work(system_power_efficient_wq, dwork, nsecs_to_jiffies(
 				group->avg_next_update - now) + 1);
 	}
 
@@ -825,7 +825,7 @@ static void psi_group_change(struct psi_group *group, int cpu,
 		psi_schedule_poll_work(group, 1, false);
 
 	if (wake_clock && !delayed_work_pending(&group->avgs_work))
-		schedule_delayed_work(&group->avgs_work, PSI_FREQ);
+		queue_delayed_work(system_power_efficient_wq, &group->avgs_work, PSI_FREQ);
 }
 
 static struct psi_group *iterate_groups(struct task_struct *task, void **iter)
@@ -1192,7 +1192,8 @@ struct psi_trigger *psi_trigger_create(struct psi_group *group,
 	t->state = state;
 	t->threshold = threshold_us * NSEC_PER_USEC;
 	t->win.size = window_us * NSEC_PER_USEC;
-	window_reset(&t->win, 0, 0, 0);
+	window_reset(&t->win, sched_clock(),
+			group->total[PSI_POLL][t->state], 0);
 
 	t->event = 0;
 	t->last_event_time = 0;
